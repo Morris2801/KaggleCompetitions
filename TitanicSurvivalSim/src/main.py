@@ -1,30 +1,34 @@
 """
-Titanic survival baseline workflow
+Titanic survival — feature engineering + model comparison
 
-General steps:
-1. Load the training and test CSV files with pandas.
-2. Inspect dataset shape, columns, missing values, and basic survival patterns.
-3. Preprocess numeric and categorical features with a scikit-learn pipeline.
-4. Train a Logistic Regression baseline model.
-5. Evaluate the model on a validation split.
-6. Retrain on all training data and write a submission CSV for the test set.
+Steps:
+1. Load train/test CSVs.
+2. Explore the data: missing values, survival rates, correlation heatmap.
+3. Engineer new features from existing columns (Title, FamilySize, etc.)
+4. Preprocess with a scikit-learn pipeline.
+5. Compare Logistic Regression vs Random Forest on a validation split.
+6. Use the better model to write the submission CSV.
 
-Tools used:
-- pathlib: file paths that work no matter where the script is started from
-- pandas: loading and manipulating CSV data
-- matplotlib: quick exploration plots
-- scikit-learn: preprocessing, model training, and evaluation
+Key idea: correlation analysis tells us HOW MUCH each column is related
+to survival (values range from -1 to +1). Positive = tends to survive,
+negative = tends to die. Features near 0 are basically noise.
+
+Feature engineering means creating NEW columns from existing ones that
+capture patterns a model can learn more easily. For example, the raw
+Name column is useless, but the Title extracted from it (Mr, Mrs, Miss)
+is very predictive.
 """
 
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 import pandas as pd
+import seaborn as sns
 from sklearn.compose import ColumnTransformer
+from sklearn.ensemble import RandomForestClassifier
 from sklearn.impute import SimpleImputer
-from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
-from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, classification_report
+from sklearn.model_selection import GridSearchCV, train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder
 
@@ -35,85 +39,178 @@ TRAIN_PATH = DATA_DIR / "train.csv"
 TEST_PATH = DATA_DIR / "test.csv"
 SUBMISSION_PATH = PROJECT_ROOT / "submission.csv"
 
-# Load the Titanic datasets.
+# ---------------------------------------------------------------------------
+# 1. LOAD DATA
+# ---------------------------------------------------------------------------
 train = pd.read_csv(TRAIN_PATH)
 test = pd.read_csv(TEST_PATH)
 
-# Print the exploration results so they are visible in the terminal.
 print("Train shape:", train.shape)
 print("Test shape:", test.shape)
-print("\nTrain preview:\n", train.head())
-print("\nTest preview:\n", test.head())
-print("\nTrain columns:\n", train.columns)
-print("\nTest columns:\n", test.columns)
-print("\nTrain info:")
-train.info()
 print("\nMissing values in train:\n", train.isnull().sum())
-print("\nMissing values in test:\n", test.isnull().sum())
-print("\nNumeric summary:\n", train.describe())
-print("\nOverall survival rate:\n", train["Survived"].value_counts(normalize=True))
 print("\nSurvival rate by sex:\n", train.groupby("Sex")["Survived"].mean())
-print("\nSurvival rate by passenger class:\n", train.groupby("Pclass")["Survived"].mean())
-print("\nSurvival rate by embarkation port:\n", train.groupby("Embarked")["Survived"].mean())
+print("\nSurvival rate by class:\n", train.groupby("Pclass")["Survived"].mean())
 
-# These two plots are simple first-pass visuals for a beginner.
-train.groupby("Sex")["Survived"].mean().plot(kind="bar", title="Survival Rate by Sex")
+# ---------------------------------------------------------------------------
+# 2. CORRELATION ANALYSIS
+# Correlation only works on numbers, so we encode Sex as 0/1 first.
+# The result shows how much each column moves TOGETHER with Survived.
+# ---------------------------------------------------------------------------
+corr_df = train.copy()
+corr_df["Sex_num"] = (corr_df["Sex"] == "female").astype(int)  # female=1, male=0
+
+numeric_cols = ["Survived", "Pclass", "Sex_num", "Age", "SibSp", "Parch", "Fare"]
+corr_matrix = corr_df[numeric_cols].corr()
+
+print("\nCorrelation with Survived:\n",
+      corr_matrix["Survived"].sort_values(ascending=False))
+
+# Visual heatmap — darker = stronger relationship (positive or negative).
+plt.figure(figsize=(8, 6))
+sns.heatmap(corr_matrix, annot=True, fmt=".2f", cmap="coolwarm", center=0)
+plt.title("Correlation Matrix\n(values close to ±1 = strong relationship with Survived)")
 plt.tight_layout()
 plt.show()
 
-train["Age"].plot(kind="hist", bins=20, title="Age Distribution")
+# Bar chart of absolute correlation with Survived (magnitude = importance proxy).
+corr_with_target = corr_matrix["Survived"].drop("Survived").abs().sort_values(ascending=True)
+corr_with_target.plot(kind="barh", title="Feature correlation with Survived (absolute)")
+plt.xlabel("Pearson |r|")
 plt.tight_layout()
 plt.show()
 
-# Modeling ------------------------------------------------
-# Start with a small feature set that is commonly useful for Titanic.
-features = ["Pclass", "Sex", "Age", "SibSp", "Parch", "Fare", "Embarked"]
+# ---------------------------------------------------------------------------
+# 3. FEATURE ENGINEERING
+# We create new columns on BOTH train and test so they match at prediction time.
+# ---------------------------------------------------------------------------
+
+def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Add derived columns that capture patterns raw columns miss."""
+    df = df.copy()
+
+    # Title: extracted from the Name field using a regex.
+    df["Title"] = df["Name"].str.extract(r",\s*([^\.]+)\.", expand=False).str.strip()
+    rare_titles = {"Rev", "Dr", "Col", "Major", "Mlle", "Countess",
+                   "Ms", "Lady", "Jonkheer", "Don", "Dona", "Capt", "Sir"}
+    df["Title"] = df["Title"].replace(list(rare_titles), "Rare")
+
+    # FamilySize and IsAlone.
+    df["FamilySize"] = df["SibSp"] + df["Parch"] + 1
+    df["IsAlone"] = (df["FamilySize"] == 1).astype(int)
+
+    # Has_Cabin.
+    df["Has_Cabin"] = df["Cabin"].notna().astype(int)
+
+    return df
+
+
+train = engineer_features(train)
+test = engineer_features(test)
+
+print("\nNew feature preview (train):\n",
+      train[["Name", "Title", "FamilySize", "IsAlone", "Has_Cabin"]].head(10))
+print("\nTitle value counts:\n", train["Title"].value_counts())
+print("\nSurvival rate by Title:\n", train.groupby("Title")["Survived"].mean())
+print("\nSurvival rate by FamilySize:\n", train.groupby("FamilySize")["Survived"].mean())
+
+# ---------------------------------------------------------------------------
+# 4. BUILD PREPROCESSING PIPELINE
+# ---------------------------------------------------------------------------
+
+# We now include the engineered features.
+numeric_features = ["Age", "Fare", "Pclass", "SibSp", "Parch", "FamilySize",
+                    "IsAlone", "Has_Cabin"]
+categorical_features = ["Sex", "Embarked", "Title"]
+
+features = numeric_features + categorical_features
 X = train[features]
 y = train["Survived"]
 X_test = test[features]
 
-# Numeric and categorical columns need different preprocessing.
-numeric_features = ["Age", "SibSp", "Parch", "Fare", "Pclass"]
-categorical_features = ["Sex", "Embarked"]
-
-# Fill missing numeric values with the median.
+# Median imputation handles the few missing Age/Fare values.
 numeric_transformer = Pipeline(steps=[
     ("imputer", SimpleImputer(strategy="median"))
 ])
 
-# Fill missing categorical values, then convert categories into numeric columns.
+# Mode imputation + one-hot encoding for text columns.
+# OneHotEncoder turns each category into its own 0/1 column.
 categorical_transformer = Pipeline(steps=[
     ("imputer", SimpleImputer(strategy="most_frequent")),
     ("onehot", OneHotEncoder(handle_unknown="ignore"))
 ])
 
-# Apply the right transformation to each column group.
 preprocessor = ColumnTransformer(transformers=[
     ("num", numeric_transformer, numeric_features),
     ("cat", categorical_transformer, categorical_features)
 ])
 
-# The pipeline keeps preprocessing and model training together.
-model = Pipeline(steps=[
+# ---------------------------------------------------------------------------
+# 5. TUNE RANDOM FOREST with GridSearchCV
+# Instead of guessing hyperparameters, we try many combinations and pick
+# the best one automatically.
+#
+# n_estimators: number of trees — more = more stable
+# max_depth: how deep each tree grows — shallower = less overfitting
+# min_samples_leaf: minimum samples required at a leaf — higher = smoother
+# max_features: how many features each tree can see — "sqrt" is standard RF
+#
+# GridSearchCV tests every combination using 5-fold cross-validation so
+# the winner is evaluated fairly, not just on one lucky split.
+# ---------------------------------------------------------------------------
+base_rf = Pipeline(steps=[
     ("preprocessor", preprocessor),
-    ("classifier", LogisticRegression(max_iter=1000))
+    ("classifier", RandomForestClassifier(random_state=42))
 ])
 
-# Hold out 20% of the training data to estimate how well the model generalizes.
-X_train, X_val, y_train, y_val = train_test_split(
-    X, y, test_size=0.2, random_state=42
-)
+param_grid = {
+    "classifier__n_estimators": [200, 400],
+    "classifier__max_depth": [4, 5, 6],
+    "classifier__min_samples_leaf": [1, 2, 4],
+    "classifier__max_features": ["sqrt"],
+}
 
-# Train the baseline model and print standard evaluation metrics.
-model.fit(X_train, y_train)
-val_preds = model.predict(X_val)
-print("\nValidation accuracy:", accuracy_score(y_val, val_preds))
-print("\nConfusion matrix:\n", confusion_matrix(y_val, val_preds))
-print("\nClassification report:\n", classification_report(y_val, val_preds))
+print("\nRunning GridSearchCV (this takes ~30 seconds)...")
+grid_search = GridSearchCV(base_rf, param_grid, cv=5, scoring="accuracy", n_jobs=-1)
+grid_search.fit(X, y)
 
-# Retrain using the full labeled dataset before predicting the unseen test data.
-model.fit(X, y)
-test_preds = model.predict(X_test)
+print("Best params:", grid_search.best_params_)
+print(f"Best cross-val accuracy: {grid_search.best_score_:.4f}")
+
+best_rf = grid_search.best_estimator_
+
+# Quick sanity check on a held-out split.
+X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
+best_rf.fit(X_train, y_train)
+val_preds = best_rf.predict(X_val)
+print("\nValidation accuracy (held-out split):", accuracy_score(y_val, val_preds))
+print(classification_report(y_val, val_preds))
+
+# ---------------------------------------------------------------------------
+# 6. FEATURE IMPORTANCE
+# ---------------------------------------------------------------------------
+rf_model = best_rf.named_steps["classifier"]
+ohe_cols = (best_rf.named_steps["preprocessor"]
+            .named_transformers_["cat"]
+            .named_steps["onehot"]
+            .get_feature_names_out(categorical_features))
+all_feature_names = numeric_features + list(ohe_cols)
+
+importance_series = pd.Series(rf_model.feature_importances_, index=all_feature_names)
+importance_series = importance_series.sort_values(ascending=True)
+
+plt.figure(figsize=(8, 6))
+importance_series.tail(15).plot(kind="barh")
+plt.title("Random Forest (tuned) — Top 15 Feature Importances")
+plt.xlabel("Importance score")
+plt.tight_layout()
+plt.show()
+
+# ---------------------------------------------------------------------------
+# 7. GENERATE SUBMISSION — retrain best RF on ALL labeled data
+# ---------------------------------------------------------------------------
+best_rf.fit(X, y)
+test_preds = best_rf.predict(X_test)
+
 submission = pd.DataFrame({
     "PassengerId": test["PassengerId"],
     "Survived": test_preds
